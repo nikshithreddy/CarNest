@@ -1,0 +1,149 @@
+image: docker:latest
+
+services:
+  - docker:dind
+
+variables:
+  AWS_REGION: "us-east-2"
+  ECR_REPOSITORY_URI: "783764618086.dkr.ecr.us-east-2.amazonaws.com/carnest"
+  CLUSTER_NAME: "carnest-cluster"
+  SERVICE_NAME: "carnest-service"
+  TASK_DEFINITION_FAMILY: "carnest-task"
+  CONTAINER_NAME: "carnest-container"
+  TARGET_GROUP_ARN_HTTP: "arn:aws:elasticloadbalancing:us-east-2:783764618086:targetgroup/carnest-be-target-group/1f082f5a0b1854f3"
+  SUBNETS: "subnet-0556bb2a6dae9b156"
+  SECURITY_GROUPS: "sg-05420e8d4ce8648f1"
+  LOAD_BALANCER_ARN: "arn:aws:elasticloadbalancing:us-east-2:783764618086:loadbalancer/app/carnest-be-load-balancer/c9c4a44e9f3b21cd"
+
+before_script:
+  # Install AWS CLI and jq
+  - apk add --no-cache python3 py3-pip aws-cli jq
+  # Check AWS CLI installation
+  - aws --version
+  # Configure AWS credentials
+  - mkdir -p ~/.aws
+  - |
+    cat > ~/.aws/credentials <<EOF
+    [default]
+    aws_access_key_id=${AWS_ACCESS_KEY_ID}
+    aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}
+    EOF
+  - |
+    cat > ~/.aws/config <<EOF
+    [default]
+    region=${AWS_REGION}
+    EOF
+  # Fetch secrets and store as JSON
+  - echo "Fetching secrets from AWS Secrets Manager..."
+  - |
+    aws secretsmanager get-secret-value \
+      --secret-id carnest-env \
+      --region us-west-2 \
+      --query SecretString \
+      --output text > /tmp/env_vars.json
+  - echo "Environment variables fetched:"
+  - cat /tmp/env_vars.json
+  # Validate that /tmp/env_vars.json is a valid JSON object
+  - echo "Validating environment variables JSON..."
+  - jq empty /tmp/env_vars.json
+  # Store ENV_VARS as the JSON string
+  - export ENV_VARS=$(cat /tmp/env_vars.json)
+  - echo "Environment variables loaded."
+
+stages:
+  - build
+  - deploy
+
+build:
+  stage: build
+  script:
+    - echo "Logging into Amazon ECR..."
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI
+    - echo "Building Docker image..."
+    # Removed --build-arg since it's unnecessary
+    - docker build -t carnest-backend:latest .
+    - echo "Tagging Docker image..."
+    - docker tag carnest-backend:latest $ECR_REPOSITORY_URI:latest
+    - echo "Pushing Docker image to Amazon ECR..."
+    - docker push $ECR_REPOSITORY_URI:latest
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploying to AWS ECS..."
+    - echo "Registering ECS task definition for Fargate..."
+    - echo "Fetching environment variables from Secrets Manager..."
+    - |
+      ENV_VARS_JSON=$(aws secretsmanager get-secret-value \
+        --secret-id carnest-env \
+        --region us-west-2 \
+        --query SecretString \
+        --output text)
+    - echo "Environment variables fetched for deployment:"
+    - echo "$ENV_VARS_JSON"
+    # Ensure ENV_VARS_JSON is a valid JSON object
+    - echo "Validating environment variables JSON..."
+    - echo "$ENV_VARS_JSON" | jq empty
+    - echo "Generating task definition JSON..."
+    - |
+      TASK_DEFINITION_JSON=$(jq -n \
+        --arg family "$TASK_DEFINITION_FAMILY" \
+        --arg networkMode "awsvpc" \
+        --arg image "$ECR_REPOSITORY_URI:latest" \
+        --arg containerName "$CONTAINER_NAME" \
+        --arg cpu "2048" \
+        --arg memory "4096" \
+        --arg executionRoleArn "arn:aws:iam::783764618086:role/ecsTaskExecutionRole" \
+        --arg awslogs_group "/ecs/carnest" \
+        --arg awslogs_region "us-east-2" \
+        --arg awslogs_stream_prefix "ecs" \
+        --argjson env_vars "$(echo "$ENV_VARS_JSON" | jq 'to_entries | map({ name: .key, value: .value })')" \
+        '{
+          family: $family,
+          networkMode: $networkMode,
+          containerDefinitions: [
+            {
+              name: $containerName,
+              image: $image,
+              memory: ($memory | tonumber),
+              cpu: ($cpu | tonumber),
+              essential: true,
+              portMappings: [
+                {
+                  containerPort: 8000,
+                  hostPort: 8000,
+                  protocol: "tcp"
+                }
+              ],
+              logConfiguration: {
+                logDriver: "awslogs",
+                options: {
+                  "awslogs-group": $awslogs_group,
+                  "awslogs-region": $awslogs_region,
+                  "awslogs-stream-prefix": $awslogs_stream_prefix
+                }
+              },
+              environment: $env_vars
+            }
+          ],
+          requiresCompatibilities: ["FARGATE"],
+          cpu: $cpu,
+          memory: $memory,
+          executionRoleArn: $executionRoleArn
+        }')
+    - echo "$TASK_DEFINITION_JSON" > task_definition.json
+    - echo "Task definition JSON:"
+    - cat task_definition.json
+    - echo "Registering new task definition..."
+    - aws ecs register-task-definition --cli-input-json file://task_definition.json
+    - echo "Updating ECS service..."
+    - |
+      aws ecs update-service \
+        --service "$SERVICE_NAME" \
+        --task-definition "$TASK_DEFINITION_FAMILY" \
+        --cluster "$CLUSTER_NAME" \
+        --load-balancers "targetGroupArn=$TARGET_GROUP_ARN_HTTP,containerName=$CONTAINER_NAME,containerPort=8000" \
+        --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=ENABLED}" \
+        --region "$AWS_REGION" \
+        --force-new-deployment
+    - echo "Deployment complete."
